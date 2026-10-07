@@ -1,0 +1,6 @@
+#!/bin/bash
+# Move OpenRouter keys from ~/.config/omarchy/agents/openrouter.json into the
+# gnome-keyring (Secret Service) and delete them from the plaintext file.
+set -e
+~/.local/bin/openrouter-agent-usage --migrate
+~/.local/bin/openrouter-agent-usage

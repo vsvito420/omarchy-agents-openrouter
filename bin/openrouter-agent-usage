@@ -1,0 +1,371 @@
+#!/usr/bin/python3
+"""Write an OpenRouter usage record for the Omarchy agents panel.
+
+The omarchy.agents widget shows every *.json record in
+~/.local/state/omarchy/agents/usage/, so this user-owned collector adds an
+OpenRouter tab without touching the packaged plugin. Run by the
+vito.openrouter bar widget.
+
+Keys come from OPENROUTER_API_KEY / OPENROUTER_MANAGEMENT_KEY, then the
+Secret Service keyring (gnome-keyring, via secret-tool), then — as a legacy
+fallback only — ~/.config/omarchy/agents/openrouter.json. `--migrate` moves
+keys out of that file into the keyring.
+
+The API key alone gives spend (today / week / month) and the key's limit.
+A management (provisioning) key adds the account credit balance and the
+token-by-day / token-by-model charts from /activity.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "openrouter"
+API_BASE_URL = "https://openrouter.ai/api/v1"
+AUTH_HELP = "Paste your OpenRouter API key below and press Save."
+
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+USAGE_DIR = STATE_HOME / "omarchy" / "agents" / "usage"
+CONFIG_PATH = CONFIG_HOME / "omarchy" / "agents" / "openrouter.json"
+
+
+class OpenRouterError(Exception):
+  pass
+
+
+def number(value: Any) -> float:
+  try:
+    return max(0.0, float(value or 0))
+  except (TypeError, ValueError):
+    return 0.0
+
+
+def base_record(**overrides: Any) -> dict[str, Any]:
+  record: dict[str, Any] = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": "OpenRouter",
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    "ready": False,
+    "hasLocalStats": False,
+    "scope": "account",
+    "hasPromptStats": False,
+    "tierLabel": "Prepaid",
+    "usageStatusText": "",
+    "authHelpText": "",
+    "limits": [],
+    "todayPrompts": 0,
+    "todaySessions": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": [],
+    "totalPrompts": 0,
+    "totalSessions": 0,
+    "activeDays": 0,
+    "activeDates": [],
+    "modelUsage": {},
+  }
+  record.update(overrides)
+  return record
+
+
+def read_config() -> dict[str, Any]:
+  try:
+    parsed = json.loads(CONFIG_PATH.read_text())
+    return parsed if isinstance(parsed, dict) else {}
+  except (OSError, json.JSONDecodeError):
+    return {}
+
+
+def request(path: str, key: str) -> dict[str, Any]:
+  req = urllib.request.Request(
+    API_BASE_URL + path,
+    headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=15) as response:
+      decoded = json.load(response)
+  except urllib.error.HTTPError as error:
+    if error.code == 401:
+      raise OpenRouterError("OpenRouter rejected the key")
+    if error.code == 403:
+      raise OpenRouterError("This OpenRouter key cannot read " + path)
+    raise OpenRouterError(f"OpenRouter API returned HTTP {error.code}")
+  except urllib.error.URLError as error:
+    raise OpenRouterError("Could not reach the OpenRouter API") from error
+  except (json.JSONDecodeError, TimeoutError) as error:
+    raise OpenRouterError("OpenRouter returned an invalid response") from error
+  data = decoded.get("data") if isinstance(decoded, dict) else None
+  return data if isinstance(data, (dict, list)) else {}
+
+
+def next_reset(period: str) -> str:
+  now = datetime.now(timezone.utc)
+  midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+  if period == "daily":
+    reset = midnight + timedelta(days=1)
+  elif period == "weekly":
+    reset = midnight + timedelta(days=7 - now.weekday())
+  elif period == "monthly":
+    reset = (midnight.replace(day=1) + timedelta(days=32)).replace(day=1)
+  else:
+    return ""
+  return reset.isoformat()
+
+
+def summarize_activity(rows: list[Any], today: date) -> dict[str, Any]:
+  recent_dates = [(today - timedelta(days=offset)).isoformat() for offset in range(6, -1, -1)]
+  recent = {day: 0 for day in recent_dates}
+  today_by_model: dict[str, int] = {}
+  model_usage: dict[str, dict[str, int]] = {}
+  active: set[str] = set()
+  requests = 0
+
+  for row in rows:
+    if not isinstance(row, dict):
+      continue
+    day = str(row.get("date") or "")[:10]
+    model = str(row.get("model") or "unknown").split("/")[-1]
+    prompt = int(number(row.get("prompt_tokens")))
+    output = int(number(row.get("completion_tokens"))) + int(number(row.get("reasoning_tokens")))
+    total = prompt + output
+    requests += int(number(row.get("requests")))
+    if total <= 0:
+      continue
+    bucket = model_usage.setdefault(model, {
+      "inputTokens": 0, "outputTokens": 0,
+      "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+    })
+    bucket["inputTokens"] += prompt
+    bucket["outputTokens"] += output
+    if day:
+      active.add(day)
+    if day in recent:
+      recent[day] += total
+    if day == today.isoformat():
+      today_by_model[model] = today_by_model.get(model, 0) + total
+
+  return {
+    "todayTotalTokens": sum(today_by_model.values()),
+    "todayTokensByModel": today_by_model,
+    "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent_dates],
+    "activeDays": len(active),
+    "activeDates": sorted(active),
+    "modelUsage": model_usage,
+    "totalPrompts": requests,
+  }
+
+
+def hint(key: str) -> str:
+  return key[:9] + "…" + key[-4:] if len(key) > 16 else ("set" if key else "")
+
+
+KEY_FIELDS = (
+  ("apiKey", "OPENROUTER_API_KEY", "OPENROUTER_SET_API_KEY", "OpenRouter API key"),
+  ("managementKey", "OPENROUTER_MANAGEMENT_KEY", "OPENROUTER_SET_MANAGEMENT_KEY", "OpenRouter management key"),
+)
+KEYRING_SERVICE = "openrouter-omarchy"
+
+
+def keyring_get(field: str) -> str:
+  try:
+    result = subprocess.run(
+      ["secret-tool", "lookup", "service", KEYRING_SERVICE, "key", field],
+      capture_output=True, text=True, timeout=10,
+    )
+  except (OSError, subprocess.TimeoutExpired):
+    return ""
+  return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def keyring_set(field: str, label: str, value: str) -> None:
+  # The secret goes over stdin, never argv, so it can't leak through ps.
+  if not value:
+    subprocess.run(["secret-tool", "clear", "service", KEYRING_SERVICE, "key", field],
+                   capture_output=True, timeout=10)
+    return
+  result = subprocess.run(
+    ["secret-tool", "store", "--label=" + label, "service", KEYRING_SERVICE, "key", field],
+    input=value, capture_output=True, text=True, timeout=30,
+  )
+  if result.returncode != 0 or keyring_get(field) != value:
+    raise OpenRouterError("Could not store the key in the keyring (is it unlocked?)")
+
+
+def write_config(config: dict[str, Any]) -> None:
+  if not config:
+    CONFIG_PATH.unlink(missing_ok=True)
+    return
+  fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+  with os.fdopen(fd, "w") as handle:
+    json.dump(config, handle, indent=2)
+    handle.write("\n")
+
+
+def strip_file_keys(fields: list[str]) -> None:
+  config = read_config()
+  if any(field in config for field in fields):
+    for field in fields:
+      config.pop(field, None)
+    write_config(config)
+
+
+def save_keys() -> None:
+  # Keys arrive through the environment so they never show up in argv / ps.
+  saved = []
+  for field, _, set_env, label in KEY_FIELDS:
+    if set_env in os.environ:
+      keyring_set(field, label, os.environ[set_env].strip())
+      saved.append(field)
+  strip_file_keys(saved)
+
+
+def migrate() -> int:
+  config = read_config()
+  moved = []
+  for field, _, _, label in KEY_FIELDS:
+    value = str(config.get(field) or "").strip()
+    if value:
+      keyring_set(field, label, value)  # raises before anything is removed
+      moved.append(field)
+  strip_file_keys([field for field, *_ in KEY_FIELDS])
+  for field, *_ in KEY_FIELDS:
+    state = "moved to keyring" if field in moved else ("in keyring" if keyring_get(field) else "not set")
+    print(f"{field}: {state}")
+  print(f"{CONFIG_PATH}: {'removed' if not CONFIG_PATH.exists() else 'kept (no keys left in it)'}")
+  return 0
+
+
+def load_keys() -> tuple[str, str, str]:
+  config = read_config()
+  keys = []
+  store = ""
+  for field, env, _, _ in KEY_FIELDS:
+    value = os.environ.get(env, "").strip()
+    if value:
+      store = store or "env"
+    else:
+      value = keyring_get(field)
+      if value:
+        store = store or "keyring"
+      else:
+        value = str(config.get(field) or "").strip()
+        if value:
+          store = "file"  # plaintext wins the label so the widget can warn
+    keys.append(value)
+  return keys[0], keys[1], store
+
+
+def scan() -> dict[str, Any]:
+  api_key, mgmt_key, store = load_keys()
+  if not api_key and not mgmt_key:
+    return base_record(usageStatusText="OpenRouter unavailable", authHelpText=AUTH_HELP)
+
+  record = base_record(ready=True)
+  record["keyHint"] = hint(api_key or mgmt_key)
+  record["hasManagementKey"] = bool(mgmt_key)
+  record["keyStore"] = store
+  notes: list[str] = []
+
+  key_info: dict[str, Any] = {}
+  if api_key:
+    key_info = request("/key", api_key)  # auth errors here are fatal
+    daily = number(key_info.get("usage_daily"))
+    monthly = number(key_info.get("usage_monthly"))
+    record["tierLabel"] = f"${daily:.2f} today · ${monthly:.2f} this month"
+    record["spend"] = {
+      "daily": daily,
+      "weekly": number(key_info.get("usage_weekly")),
+      "monthly": monthly,
+      "total": number(key_info.get("usage")),
+      "limit": None if key_info.get("limit") is None else number(key_info.get("limit")),
+      "limitRemaining": None if key_info.get("limit_remaining") is None else number(key_info.get("limit_remaining")),
+      "limitReset": str(key_info.get("limit_reset") or ""),
+      "label": str(key_info.get("label") or ""),
+    }
+
+    limit = key_info.get("limit")
+    if limit is not None and number(limit) > 0:
+      remaining = number(key_info.get("limit_remaining"))
+      period = str(key_info.get("limit_reset") or "")
+      record["limits"].append({
+        "label": "Key limit" + (f" ({period})" if period else ""),
+        "title": "Key limit",
+        "percent": min(1.0, max(0.0, 1 - remaining / number(limit))),
+        "resetsAt": next_reset(period),
+      })
+
+  try:
+    credits = request("/credits", mgmt_key or api_key)
+    funded = number(credits.get("total_credits"))
+    spent = number(credits.get("total_usage"))
+    record["balance"] = {
+      "remaining": max(0.0, funded - spent),
+      "funded": funded,
+      "spent": spent,
+      "currency": "USD",
+      "estimated": False,
+    }
+  except OpenRouterError as error:
+    notes.append(str(error) + " (credits need a management key)")
+
+  if mgmt_key:
+    try:
+      rows = request("/activity", mgmt_key)
+      if isinstance(rows, list):
+        record.update(summarize_activity(rows, datetime.now(timezone.utc).date()))
+        record["hasLocalStats"] = True
+    except OpenRouterError as error:
+      notes.append(str(error))
+
+  if notes and "balance" not in record and not record["limits"]:
+    record["usageStatusText"] = "Balance unavailable"
+    record["authHelpText"] = "; ".join(notes)
+  return record
+
+
+def main() -> int:
+  if "--migrate" in sys.argv:
+    try:
+      return migrate()
+    except OpenRouterError as error:
+      print(f"openrouter-agent-usage: {error}", file=sys.stderr)
+      return 1
+  if "--save" in sys.argv:
+    try:
+      save_keys()
+    except OpenRouterError as error:
+      print(str(error), file=sys.stderr)
+  try:
+    record = scan()
+  except OpenRouterError as error:
+    record = base_record(usageStatusText="OpenRouter unavailable", authHelpText=str(error))
+  except Exception as error:
+    record = base_record(usageStatusText="OpenRouter unavailable", authHelpText="OpenRouter usage scan failed")
+    print(f"openrouter-agent-usage: {type(error).__name__}: {error}", file=sys.stderr)
+
+  if "--print" in sys.argv:
+    print(json.dumps(record, indent=2))
+    return 0
+
+  USAGE_DIR.mkdir(parents=True, exist_ok=True)
+  fd, tmp = tempfile.mkstemp(prefix=".openrouter.", dir=USAGE_DIR)
+  with os.fdopen(fd, "w") as handle:
+    json.dump(record, handle, separators=(",", ":"))
+    handle.write("\n")
+  os.replace(tmp, USAGE_DIR / f"{AGENT_ID}.json")
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

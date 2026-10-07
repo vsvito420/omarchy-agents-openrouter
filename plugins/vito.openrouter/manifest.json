@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "vito.openrouter",
+  "name": "OpenRouter",
+  "version": "1.0.0",
+  "author": "vito",
+  "description": "OpenRouter credits and spend, with key entry and refresh",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OpenRouter",
+    "description": "OpenRouter credits and spend, with key entry and refresh",
+    "category": "System",
+    "allowMultiple": false
+  }
+}
